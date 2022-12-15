@@ -1,0 +1,300 @@
+---
+title: "wk6"
+output: html_document
+date: "2022-12-04"
+---
+
+point pattern analysis
+
+question: For any given London Borough, are the Blue Plaques within that borough distributed randomly or do they exhibit some kind of dispersed or clustered pattern? focus on Harrow. 
+
+data: 
+* London Borough map.shp
+* Blue Plaques. csv
+
+```{r}
+
+library(spatstat)
+library(spatstat)
+library(here)
+library(sp)
+library(rgeos)
+library(maptools)
+library(tmap)
+library(sf)
+library(geojson)
+library(geojsonio)
+library(tmaptools)
+library(stringr)
+library(tidyverse)
+library(sf)
+library(janitor)
+library(dplyr)
+library(raster)
+library(fpc)
+library(dbscan)
+library(ggplot2)
+
+```
+
+# data loading 
+CRS: OSGB36 / British National Grid
+```{r}
+
+LondonBoroughs <- st_read(here::here("statistical-gis-boundaries-london", "ESRI", "London_Borough_Excluding_MHW.shp")) 
+
+BluePlaques <- st_read("https://s3.eu-west-2.amazonaws.com/openplaques/open-plaques-london-2018-04-08.geojson")
+
+```
+
+filter and uniform the CRS code 27700, now that is British National Grird. then look at what we got
+```{r}
+BoroughMap <- LondonBoroughs %>%
+  dplyr::filter(str_detect(GSS_CODE, "^E09"))%>%
+  st_transform(., 27700)
+
+qtm(BoroughMap)
+
+BluePlaques <- BluePlaques %>%
+  st_transform(.,27700)
+
+
+```
+Check class- 
+```{r}
+
+summary(BluePlaques)
+
+```
+
+##make a map
+Plot the blueplaques in londonboroughs 
+to make sure we got the right coordinates system and the map looks reasonable. 
+
+```{r}
+tmap_mode("plot")
+tm_shape(BoroughMap) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaques) +
+  tm_dots(col = "blue")
+```
+as the map shows that some of blueplaques are outside the london boundary, hence it is important to drop them out. 
+
+#data cleansing 
+1. remove duplicates using distinct function 
+2. then put them together 裁掉不需要的数据
+3. plot a map to check that is going on 
+```{r}
+
+BluePlaques <- distinct(BluePlaques)
+
+BluePlaquesSub <- BluePlaques[BoroughMap,]
+
+tmap_mode("plot")
+tm_shape(BoroughMap) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaquesSub) +
+  tm_dots(col = "blue")
+
+```
+As the map shows that the blueplauque outside the London boundary has been removed.we can see it from 2812 to 2798. 
+
+#study area
+
+```{r}
+Harrow <- BoroughMap %>%
+  filter(., NAME=="Harrow")
+
+tm_shape(Harrow) +
+  tm_polygons(col = NA, alpha = 0.5)
+
+#clip the data to our single borough
+BluePlaquesSub <- BluePlaques[Harrow,]
+
+#check that it's worked
+tmap_mode("plot")
+
+tm_shape(Harrow) +
+  tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaquesSub) +
+  tm_dots(col = "blue")
+
+window <- as.owin(Harrow)
+plot(window)
+
+```
+
+
+# data analysis
+
+using pakcage called spatstat, which firstly need a observation window. 
+
+```{r}
+
+window <- as.owin(BoroughMap)
+plot(window)
+
+```
+```{r}
+
+#create a sp object
+BluePlaquesSub<- BluePlaquesSub %>%
+  as(., 'Spatial')
+
+#create a ppp object
+BluePlaquesSub.ppp <- ppp(x=BluePlaquesSub@coords[,1],
+                          y=BluePlaquesSub@coords[,2],
+                          window=window)
+
+BluePlaquesSub@coords[,1]
+
+```
+
+Ripley’s K:
+
+```{r}
+K <- BluePlaquesSub.ppp %>%
+  Kest(., correction="border") %>%
+  plot()
+```
+
+
+```{r}
+Kval <- as.data.frame(Kest(BluePlaquesSub.ppp, correction = "Ripley"))
+```
+
+reuslt of K 
+
+The plot for K has a number of elements that are worth explaining.  First, the Kpois(r) line in Red is the theoretical value of K for each distance window (r) under a Poisson assumption of Complete Spatial Randomness.  The Black line is the estimated values of K accounting for the effects of the edge of the study area.
+
+Observed data above the Poisson model, hence Blue Plaques appear to be clustered in London. 
+
+Here, the correction specifies how points towards the edge are dealt with, in this case, border means that points towards the edge are ignored for the calculation but are included for the central points.At the same time, Ripley’s K can only telling us if we have spatial clusters present in our point data, but they are not able to tell us where in our area of interest the clusters are occurring.To cope with it, DBSCAN will be used to analysis this question.
+
+```{r}
+st_geometry(BoroughMap)
+
+#first extract the points from the spatial points data frame
+BluePlaquesSubPoints <- BluePlaquesSub %>%
+  coordinates(.)%>%
+  as.data.frame()
+
+#now run the dbscan analysis
+db <- BluePlaquesSubPoints %>%
+  fpc::dbscan(.,eps = 700, MinPts = 4)
+
+BluePlaquesSubPoints%>%
+  dbscan::kNNdistplot(.,k=4)
+
+#now plot the results
+plot(db, BluePlaquesSubPoints, main = "DBSCAN Output", frame = F)
+plot(BoroughMap$geometry, add=T)
+
+
+
+```
+
+```{r}
+db
+
+```
+
+```{r}
+
+db$cluster
+
+```
+
+```{r}
+BluePlaquesSubPoints<- BluePlaquesSubPoints %>%
+  mutate(dbcluster=db$cluster)
+```
+
+
+
+
+```{r}
+chulls <- BluePlaquesSubPoints %>%
+  group_by(dbcluster) %>%
+  dplyr::mutate(hull = 1:n(),
+  hull = factor(hull, chull(coords.x1, coords.x2)))%>%
+  arrange(hull)
+
+```
+
+```{r}
+chulls <- chulls %>%
+  filter(dbcluster >=1)
+```
+
+```{r}
+dbplot <- ggplot(data=BluePlaquesSubPoints, 
+                 aes(coords.x1,coords.x2, colour=dbcluster, fill=dbcluster)) 
+#add the points in
+dbplot <- dbplot + geom_point()
+#now the convex hulls
+dbplot <- dbplot + geom_polygon(data = chulls, 
+                                aes(coords.x1,coords.x2, group=dbcluster), 
+                                alpha = 0.5) 
+#now plot, setting the coordinates to scale correctly and as a black and white plot 
+#(just for the hell of it)...
+dbplot + theme_bw() + coord_equal()
+```
+
+```{r}
+
+library(tmaptools)
+library(tmap)
+library(sf)
+library(rosm)
+
+Harrow <- sf::st_transform(Harrow, "EPSG:4326")
+
+Harrow_basemap <- osm.raster(sf::st_bbox(Harrow), crop = TRUE, type = "cartolight")
+
+tmap_mode("plot")
+tmap_options(max.raster = c(plot = 10000000, view = 1000000))
+final_map <- 
+  tm_shape(shp = Harrow_basemap) +
+  tm_rgb() +
+  tm_shape(shp = BluePlaquesSub) +
+   tm_polygons(col = NA, alpha = 0.5) +
+tm_shape(BluePlaquesSubPoints)+
+  tm_dots(col = "dbcluster",  palette = colours, style = "cat")
+
+final_map
+
+#reflection maybe there are some other factors might influence this clustering and combine it to the reflection (trying to think the wider context of it). 
+
+# someone publish the dataset with the bias. misreporting and misunderstanding. Because data is from themselves. 
+
+# the data might perfecting fit the question, 
+
+#something just related to your study areas rather than the whole area of the world. 
+
+#this is useful for who and how? identify the eviction in New York. Allocated the people and how can we help the people to solve this problem. we can add further analysis on it and help individuals and giving more relatively support. 
+
+# find a eviction in a borough, and which specific area 
+
+#K-distance, looking for the most significantly knee. 
+
+# correction = border  
+
+# interpret the result 
+
+# reflection process of identifying 
+
+
+#tmaptools::palette_explorer()
+library(RColorBrewer)
+library(tmaptools)
+colours<- get_brewer_pal("Set1", n = 19)
+
+tmap_mode("plot")
+tm_shape(Harrow) +
+  tm_polygons(col = NA, alpha = 0.5) +
+#tm_shape("chulls", na="") +
+  tm_dots(col = "dbcluster",  palette = colours, style = "cat")
+
+```
+
